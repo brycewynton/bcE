@@ -55,11 +55,15 @@ import java.util.*;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.PriorityBlockingQueue;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.annotations.SerializedName;
 import com.google.gson.reflect.TypeToken;
+
+import javax.swing.text.Utilities;
 
 
 class BlockRecord implements Comparable<BlockRecord>, Comparator<BlockRecord>
@@ -536,14 +540,12 @@ class KeyManager // class to manage the creation and distribution of public and 
     }
 }
 
-
-
 /*
     Worker that handles incoming Public Keys
  */
 class PublicKeyWorker extends Thread
 {
-    Socket keySocket;
+    private Socket keySocket;
     // only member variable and will remain local
 
     PublicKeyWorker(Socket _socket)
@@ -554,23 +556,249 @@ class PublicKeyWorker extends Thread
 
     public void run()
     {
+        System.out.println("Public Key Client now Connected");
+        // print to console when the public key worker connects to the server
+        ObjectInputStream input;
+        // declare an object input stream variable input
+        if (bcE.processID == 2)
+        {
+            return;
+            // exit out of this code block since process 2 already has keys being managed
+        }
+
         try
         {
-            BufferedReader input = new BufferedReader(new InputStreamReader(keySocket.getInputStream()));
-            // declare and initialize new Buffered Reader for our input
-            String data = input.readLine();
-            // declare and initialize variable data to hold our input in String format
-            System.out.println("Got key: " + data);
-            // print out our key to the console
-            keySocket.close();
-            // close the keySocket off
-        } catch (IOException ioe)
+            input = new ObjectInputStream(this.keySocket.getInputStream());
+            // initialize new object input stream
+            try
+            {
+                PublicKey publicKey = (PublicKey) input.readObject();
+                // declare and initialize a new public key for the incoming block
+                System.out.println("Process " + bcE.processID + " got new key: " + publicKey.toString());
+                // print out which process has been assigned a new public key
+
+                if (DemonstrateUtils.getKeyManager() == null)
+                {
+                    System.out.println("Public Key set");
+                    // print ou that the public key is being set
+                    DemonstrateUtils.setManageKeys(new KeyManager(publicKey));
+                    // set the public key
+                }
+            } catch (Exception exception)
+            {
+                bcE.errorLog("Server Error when setting Public Keys", exception);
+                exception.printStackTrace();
+                System.out.println();
+            } finally
+            {
+                input.close();
+                // safely close the object input stream
+                this.keySocket.close();
+                // close the keysocket for the respective process
+            }
+        } catch (IOException exception)
         {
-            ioe.printStackTrace();
+            bcE.errorLog("Socket Error " , exception);
+            exception.printStackTrace();
+            System.out.println();
             // print out any exceptions caught out to console to debug
         }
     }
 }
+
+class ManageKeyWorker
+{
+    private Socket socket;
+    // declare private socket member variable
+    private KeyManager manageKeys;
+    // declae private keymanager variable
+
+    ManageKeyWorker(Socket _socket, KeyManager _manageKeys)
+    {
+        this.socket = _socket;
+        // bind to socket being passed in constructor
+        this.manageKeys = _manageKeys;
+        // bind to manageKeys being passed in constructor
+    }
+
+    public void run()
+    {
+        System.out.println("Manage Key Client Connected");
+        // print out to the console when we beign running the ManageKeyWorker
+        PrintStream output = null;
+        // declare and initialize a new print stream to null
+        BufferedReader bufferedReader = null;
+        // declare and initialize a buffered reader variableto null
+
+        try
+        {
+            bufferedReader = new BufferedReader(new InputStreamReader(this.socket.getInputStream()));
+            // initialize the buffered reader input object to a new buffered reader and pass the right socket for each respective process
+            try
+            {
+                String recordBlock = "";
+                // declare a new record block variable and initialize to an empty string
+                String incomingBlock;
+                // declare a string variable to hold incoming blocks
+                while ((incomingBlock = bufferedReader.readLine()) != null)
+                {
+                    recordBlock += incomingBlock;
+                    // add incoming block data to the record block string
+                }
+
+                BlockRecord sendBlock = DemonstrateUtils.DeserializeBlockRecord(recordBlock);
+                // grab the block about to be multicast
+                byte[] blockHashArr = DemonstrateUtils.getHashByteArray(DemonstrateUtils.SerializeDataBlock(sendBlock.getDataBlock()));
+                // store the hashed data block in the byte array blockHashArr
+
+                StringBuffer stringBuffer = new StringBuffer();
+                // declare and initialize a new String Buffer
+                for (int i = 0; i < blockHashArr.length; i++)
+                {
+                    stringBuffer.append(Integer.toString((blockHashArr[i] & 0xFF) + 0x100, 16).substring(1));
+                    // concatenate blockHAsh in the string buffer
+                }
+
+                String SHA256String = stringBuffer.toString();
+                // save the SHA256 hash string in a string variable
+                sendBlock.setHashedBlock(SHA256String);
+                // set the block about to be sent with the sha256 hashed string
+
+                byte[] signedBlockID = this.manageKeys.signData(sendBlock.getBlockID().getBytes("UTF-8"));
+                // declare and initialize a byte array to store the newly signed block
+                sendBlock.setSignedBlockID(Base64.getEncoder().encodeToString(signedBlockID));
+                // set the signed block ID on the send block
+
+                int[] unverifiedBlockPortArr = Ports.getUsedUVBPorts();
+                // get all used Unverified Block Server ports and store in newly declared integer array
+                for (int i = 0; i < unverifiedBlockPortArr.length; i++)
+                {
+                    if (sendBlock.getBlockID().equals("0")) // number of our fake block without a real BlockID
+                    {
+                        System.out.println("Sending *Fake Block* to Process: " + i);
+                        // print out to console to which process we are sending the fake block
+                    }
+                    else
+                    {
+                        System.out.println("Sending Unverified Block to Process: " + i);
+                        // print to console to which process we are sending the real unverified block
+                    }
+
+                    Socket UVBserverSocket = new Socket(bcE.serverName, unverifiedBlockPortArr[i]);
+                    // declare a new unverified block server socket and feed it the proper port for the respective process
+                    output = new PrintStream(UVBserverSocket.getOutputStream());
+                    // initialize a new print stream from server and store it in variable output
+                    output.println(DemonstrateUtils.SerializeBlockRecord(sendBlock));
+                    // serialize our send block for json multicast
+                    output.flush();
+                    // flush the print stream
+                    output.close();
+                    // close the print stream
+                    UVBserverSocket.close();
+                    // close the unverified block server socket
+                }
+            } catch (Exception exception)
+            {
+                bcE.errorLog("Error when attempting to multicast ", exception);
+                exception.printStackTrace();
+                System.out.println();
+            } finally {
+                this.socket.close();
+                // safely close the specific process socket
+                bufferedReader.close();
+                // safely close the buffered reader input
+            }
+        } catch (IOException exception)
+        {
+            bcE.errorLog("Socket Error in ManageKeyWorker" , exception);
+            exception.printStackTrace();
+            System.out.println();
+        }
+    }
+}
+
+class BlockchainWorker extends Thread
+{
+    private Socket socket;
+    // private member variable socket for our blockchain worker
+    private static final Lock serializeLock = new ReentrantLock();
+    // declare a final Lock variable to ensure avoid concurrency errors
+    BlockchainWorker(Socket _sock)
+    {
+        this.socket = _sock;
+        // bind process specific socket to _sock in constructor
+    }
+
+    public void run()
+    {
+        System.out.println("Blockchain Client now Connected");
+        // print to the console when we begin running the BlockchainWorker
+        BufferedReader bufferedReader = null;
+        // declare and initialize a new input buffered reader to null
+        try
+        {
+            bufferedReader = new BufferedReader(new InputStreamReader(this.socket.getInputStream()));
+            // initialize the buffered reader input for current process's socket
+            try
+            {
+                String newLedger = "";
+                // declare a new ledger variable to hold incoming block information and initialize to an empty string
+                String incomingBlock;
+                // declare a string variable to hold the data in the incoming block
+                while ((incomingBlock = bufferedReader.readLine()) != null)
+                {
+                    newLedger += incomingBlock;
+                    // add the read incoming block to the new ledger string
+                }
+
+                bcE.BlockLedger = DemonstrateUtils.DeserializeBlockchainLedger(newLedger);
+                // update the main blockchain ledger by deserializing the newly concatenated ledger
+
+                if (bcE.processID == 0)
+                {
+                    this.exportLedger();
+                    // export the final blockchain ledger from process 0
+                }
+            } catch (Exception exception)
+            {
+                bcE.errorLog("Error encountered in Blockchain Server", exception);
+                exception.printStackTrace();
+                System.out.println();
+            } finally
+            {
+                this.socket.close();
+                // close the particular process' socket
+                bufferedReader.close();
+                // safely close the buffered reader input connection
+            }
+        } catch (IOException exception)
+        {
+            bcE.errorLog("Socket Error in Blockchain Worker", exception);
+            exception.printStackTrace();
+            System.out.println();
+        }
+    }
+
+    private void exportLedger()
+    {
+        System.out.println("Exporting last Updated Blockchain Ledger");
+        // print to the console when this method begins to execute
+        try
+        {
+            BufferedWriter bufferedWriter = null;
+            // declare a buffered writer variable and temporarily initialize to null
+            String serializedBlock;
+            // declare a string to hold the serialized block object
+            serializeLock.lock();
+            // lock serializables while manipulating to avoid critical failure
+            try
+            {
+                serializedBlock = this.
+            }
+        }
+    }
+}
+
 
 class PublicKeyServer implements Runnable
 {
@@ -646,45 +874,6 @@ class UVBServer implements Runnable
         }
     };
 
-    class UVBWorker extends Thread
-    {
-        Socket socket;
-        // socket member variable
-
-        UVBWorker (Socket _sock)
-        {
-            socket = _sock;
-            // assign socket to argument _sock
-        }
-
-        BlockRecord BR = new BlockRecord();
-        // declare and initialize a new BlockRecord
-
-        public void run()
-        {
-            System.out.println("In Unverified Block Worker");
-            // print out debugging statement to know where we are in console
-            try
-            {
-                ObjectInputStream unverifiedInput = new ObjectInputStream(socket.getInputStream());
-                // declare a new Object Input Stream and assign to variable unverifiedInput
-                BR = (BlockRecord) unverifiedInput.readObject();
-                // read in block record from unverified input and save it to variable BR
-                System.out.println("Received Unverified Block: " + BR.getTimeStamp() + " " + BR.getData());
-                // print to the console the unverified blocks timestamp and data contained
-                queue.put(BR);
-                // add our block record to our blocking queue
-                // may fail if we do not have our queue set to be large enough to contain all puts
-                socket.close();
-                // close the sockets connection
-            } catch (Exception exception)
-            {
-                exception.printStackTrace();
-                // print out any exceptions caught to the console to debug
-            }
-        }
-    }
-
     public void run()
     {
         int q_len = 6;
@@ -716,41 +905,6 @@ class UVBServer implements Runnable
 
 
 
-class BlockchainWorker extends Thread
-{
-    Socket socket;
-    // declare a socket for our blockchain worker
-    BlockchainWorker(Socket _sock)
-    {
-        socket = _sock;
-        // assign socket to _sock in constructor
-    }
-
-        public void run()
-        {
-            try
-            {
-                BufferedReader input = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-                String blockData = "";
-                // declare and initialize block data to an empty string
-                String blockDataInput = input.readLine();
-                // declare and initialize a block data input variable  that takes in input from our Buffered Reader
-                while((blockDataInput = input.readLine()) != null)
-                {
-                    blockData = blockData + "\n" + blockDataInput + "\n\r\n\r";
-                    // print put block data to the console
-                }
-                bcE.fakeBlock = blockData;
-                // replace with winning blockchain
-                System.out.println(" _____________New Blockchain_____________\n" + bcE.fakeBlock + "\n\n");
-                socket.close();
-                // close our sockdt
-            } catch (IOException ioe)
-            {
-                ioe.printStackTrace();
-            }
-        }
-}
 
 
 class BlockchainServer implements Runnable
@@ -1022,32 +1176,27 @@ class DemonstrateUtils
     }
 }
 
-class UVBConsumer implements Runnable
-{
-    public void run()
-    {
+class UVBConsumer implements Runnable {
+    public void run() {
         BlockRecord blockRecord;
 
         System.out.println("Now in Unverified Block Consumer");
 
         try {
-            while(true)
-            {
+            while (true) {
                 boolean hasBlock = false;
                 // declare a new bool adn set to false for if there is a block
                 blockRecord = bcE.BlockchainPriorityQueue.take();
                 // take a block from our priority queue and save it in our block record object
                 System.out.println("Unverified Blockchain Consumer received a new UVB: " + DemonstrateUtils.SerializeBlockRecord(blockRecord));
                 // print out that a new unverified block was received by UVB consumer and serialize said block
-                for (BlockRecord ledger: bcE.BlockLedger)
-                {
-                    if (ledger.getBlockID().compareToIgnoreCase(blockRecord.getBlockID()) == 0){
+                for (BlockRecord ledger : bcE.BlockLedger) {
+                    if (ledger.getBlockID().compareToIgnoreCase(blockRecord.getBlockID()) == 0) {
                         hasBlock = true;
                         break;
                     }
                 }
-                if (!validBlock(blockRecord))
-                {
+                if (!validBlock(blockRecord)) {
                     continue;
                 }
                 try {
@@ -1059,8 +1208,7 @@ class UVBConsumer implements Runnable
                     // set the verification process id to the current process ID
                     String previousHash;
                     // declare previous hash variable
-                    if (!blockRecord.getBlockID().equals("0") && bcE.BlockLedger.size() != 0)
-                    {
+                    if (!blockRecord.getBlockID().equals("0") && bcE.BlockLedger.size() != 0) {
                         int previousBlockNumber = bcE.BlockLedger.size() - 1;
                         // set the previous blocks number to the last index
                         previousHash = bcE.BlockLEdger.get(previousBlockNumber).getPreviousHash();
@@ -1068,16 +1216,14 @@ class UVBConsumer implements Runnable
                         previousHash = DatatypeConverter.printHexBinary(DemonstrateUtils.getHashByteArray(blockRecord.getHashedBlock()));
                         // turn the hash byte array into a string and set it as previous hash
                     }
-                    for (int i = o; i < 700; i++)
-                    {
+                    for (int i = o; i < 700; i++) {
                         String randSeed = this.randomAlphaNumeric(10);
                         // new random string
-                        String concatenatedString = previousHash + randomSeed;
+                        String concatenatedString = previousHash + randSeed;
                         // concatenate random sring with the previosu hash and save it concatenateString variable
                         String newHash = DatatypeConverter.printHexBinary(DemonstrateUtils.getHashByteArray(concatenatedString));
                         // convert our concatenated string into byte array and then then to a string to save in new hash variable
-                        if (this.isWinningHash(newHash))
-                        {
+                        if (this.isWinningHash(newHash)) {
                             blockRecord.setRandomSeed(randSeed);
                             // set the random seed to reflect that the work was competed for and solved
                             blockRecord.setPreviousHash(concatenatedString);
@@ -1086,33 +1232,26 @@ class UVBConsumer implements Runnable
                             // quit out once we have the hashes set in block record object
                         }
 
-                        for (BlockRecord ledger: bcE.BlockLedger)
-                        {
-                            if (ledger.getBlockID().compareToIgnoreCase(blockRecord.getBlockID()) == 0)
-                            {
+                        for (BlockRecord ledger : bcE.BlockLedger) {
+                            if (ledger.getBlockID().compareToIgnoreCase(blockRecord.getBlockID()) == 0) {
                                 System.out.println("This Block has already been verified...\nWaiting for new Block");
                                 hasBlock = true;
                                 break;
                             }
                         }
-                        if (hasBlock)
-                        {
+                        if (hasBlock) {
                             break;
                             // exit out if hasBlock is already true
                         }
                     }
-                } catch (Exception exception)
-                {
+                } catch (Exception exception) {
                     bcE.errorLog("Error when performing work....", exception);
                     exception.printStackTrace();
                     System.out.println();
                 }
-                if (!hasBlock)
-                {
-                    for (BlockRecord ledger: bcE.BlockLedger)
-                    {
-                        if (ledger.getBlockID().compareToIgnoreCase(blockRecord.getBlockID()) == 0)
-                        {
+                if (!hasBlock) {
+                    for (BlockRecord ledger : bcE.BlockLedger) {
+                        if (ledger.getBlockID().compareToIgnoreCase(blockRecord.getBlockID()) == 0) {
                             System.out.println("((2)) Block already verified... Waiting");
                             hasBlock = true;
                             break;
@@ -1121,21 +1260,142 @@ class UVBConsumer implements Runnable
                     if (!hasBlock) // if a process did not solve yet just add the record and count it as verified
                     {
                         bcE.BlockLedger.add(blockRecord);
-                        this.SendVerified();
+                        this.sendVerified();
                     }
                 }
             }
-        } catch (Exception exception)
-        {
+        } catch (Exception exception) {
             bcE.errorLog("Exception caught when attempting to verify Block...", exception);
             exception.printStackTrace();
             System.out.println();
         }
     }
 
-    private boolean isWinningHash(String _winningHash) throws Exception
-    {
+    private boolean isWinningHash(String _winningHash) throws Exception {
+        int prefix = Integer.parseInt(_winningHash.substring(0, 4), 16);
+        // turn our potential winning hash string into hexadecimal and then parse int
 
+        if (prefix < 30000) {
+            return true;
+            // if the prefix is less than 30000 then it is the winning prefix
+        } else {
+            return false;
+        }
+    }
+
+    private String randomAlphaNumeric(int _seed) {
+        String alphaNumeric = "abcdefghijklmnopqrstuvwxyz0123456789";
+        // declare a string with all possible alpha numerics
+        StringBuilder stringBuilder = new StringBuilder();
+        // declare and initialize a new string builder object
+        while (_seed-- != 0) // iterate until the seed numeric is zero
+        {
+            int character = (int) (Math.random() * alphaNumeric.length());
+            // assign a random alpha numeric value to character variable
+            stringBuilder.append(alphaNumeric.charAt(character));
+            // build random seed
+        }
+        return stringBuilder.toString();
+        // return the new random alpha numeric string
+    }
+
+    public void sendVerified() throws Exception
+    {
+        PrintStream output;
+        // declare new print stream variable
+        Socket socket;
+        // declare new socket variable
+
+        int[] blockchainServerPorts = Ports.getUsedBlockchainPorts();
+        // fill an int array with the blockchain server ports currently in use
+        for (int i = 0; i < blockchainServerPorts.length; i++)
+        {
+            socket = new Socket(bcE.serverName, blockchainServerPorts[i]);
+            // bind the socket to the correct process port
+            output = new PrintStream(socket.getOutputStream());
+            // initialize print stream
+            System.out.println("Sending updated Ledger");
+            // tell the console that the new ledger is being multicast
+            output.println(DemonstrateUtils.SerializeBlockRecord(bcE.BlockLedger));
+            // multicast the serialized block record
+            output.flush();
+            // flush the print stream
+            output.close();
+            // close the connection
+            socket.close();
+            // close socket connection
+        }
+    }
+
+    public boolean validBlock(BlockRecord _blockRecord) throws Exception {
+        byte[] signedBlockArr = Base64.getDecoder().decode(_blockRecord.getSignedBlockID());
+        // declare an array to hold the signed block in byte array format
+        byte[] signedBlock = Base64.getDecoder().decode(_blockRecord.getSignedBlockID());
+        // declare an array to hold the signed block in byte array format
+
+        if (!DemonstrateUtils.getKeyManager().verifySig(_blockRecord.getBlockID().getBytes(), signedBlockArr) || !DemonstrateUtils.getKeyManager().verifySig(_blockRecord.getHashedBlock().getBytes(), signedBlock)) {
+            System.out.println("SIGNATURE INVALID");
+            // print out error to console
+            return false;
+        }
+        return true;
+    }
+}
+
+class UVBWorker extends Thread
+{
+    private Socket socket;
+    // socket member variable
+
+    UVBWorker (Socket _sock)
+    {
+        this.socket = _sock;
+        // bind socket to argument _sock
+    }
+
+    public void run()
+    {
+        System.out.println("Unverified Block Worker connected");
+        // print out debugging statement to know where we are in console
+        BufferedReader bufferedReader = null;
+        // declare new bufferedReader object
+        try
+        {
+            bufferedReader = new BufferedReader(new InputStreamReader(this.socket.getInputStream()));
+            // initialize bufferedReader for desgnated socket
+            try
+            {
+                System.out.println("Received new Unverified Block");
+                // print out when a new UVB is received
+                String newBlock = "";
+                // declare a string to hold the new block information
+                String incomingBlock;
+                // declare a variable to hold the block being received
+                while ((incomingBlock = bufferedReader.readLine()) != null)
+                {
+                    newBlock += incomingBlock;
+                    // add incoming block information to the new block
+                }
+                bcE.BlockchainPriorityQueue.put(DemonstrateUtils.DeserializeBlockRecord(newBlock));
+                // add the new block into the priority queue
+            } catch (Exception exception)
+            {
+                bcE.errorLog("Server Error" , exception);
+                exception.printStackTrace();
+                System.out.println();
+            } finally
+            {
+                bufferedReader.close();
+                // close the bufferedReader
+                this.socket.close();
+                // close the connected socket for the respective process
+            }
+        } catch (Exception exception)
+        {
+            bcE.errorLog("IO Exception, failed to bind socket " , exception);
+            exception.printStackTrace();
+            System.out.println();
+        }
     }
 }
 
